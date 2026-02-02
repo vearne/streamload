@@ -1,0 +1,574 @@
+package streamload
+
+import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	bzip2 "github.com/dsnet/compress/bzip2"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
+)
+
+// CompressionType represents the compression algorithm
+type CompressionType string
+
+const (
+	CompressionNone  CompressionType = ""
+	CompressionGZIP  CompressionType = "GZIP"
+	CompressionLZ4   CompressionType = "LZ4_FRAME"
+	CompressionZSTD  CompressionType = "ZSTD"
+	CompressionBZIP2 CompressionType = "BZIP2"
+)
+
+// DataFormat represents the data format
+type DataFormat string
+
+const (
+	FormatCSV  DataFormat = "csv"
+	FormatJSON DataFormat = "json"
+)
+
+// LoadOptions represents options for stream load
+type LoadOptions struct {
+	Format          DataFormat
+	Compression     CompressionType
+	Columns         string
+	ColumnSeparator string
+	RowDelimiter    string
+	Where           string
+	MaxFilterRatio  string
+	Timeout         time.Duration
+	TimeoutStr      string
+	StrictMode      bool
+	StripOuterArray bool
+
+	Label               string
+	Partitions          []string
+	TemporaryPartitions []string
+
+	LogRejectedRecordNum int
+	Timezone             string
+	LoadMemLimit         int64
+}
+
+// Client represents a StarRocks stream load client
+type Client struct {
+	httpClient    *http.Client
+	baseURL       string
+	database      string
+	username      string
+	password      string
+	defaultHeader map[string]string
+}
+
+// NewClient creates a new StarRocks stream load client
+func NewClient(host, port, database, username, password string) *Client {
+	return &Client{
+		httpClient: &http.Client{
+			Timeout: 30 * time.Minute,
+		},
+		baseURL:       fmt.Sprintf("%s:%s", host, port),
+		database:      database,
+		username:      username,
+		password:      password,
+		defaultHeader: make(map[string]string),
+	}
+}
+
+// SetHTTPClient sets a custom HTTP client
+func (c *Client) SetHTTPClient(client *http.Client) {
+	c.httpClient = client
+}
+
+// SetDefaultHeader sets a default header for all requests
+func (c *Client) SetDefaultHeader(key, value string) {
+	c.defaultHeader[key] = value
+}
+
+// LoadResponse represents the response from StarRocks
+type LoadResponse struct {
+	Status                    string `json:"Status"`
+	Message                   string `json:"Message"`
+	NumberTotalRows           int    `json:"NumberTotalRows"`
+	NumberLoadedRows          int    `json:"NumberLoadedRows"`
+	NumberFilteredRows        int    `json:"NumberFilteredRows"`
+	NumberUnselectedRows      int    `json:"NumberUnselectedRows"`
+	LoadBytes                 int    `json:"LoadBytes"`
+	LoadTimeMs                int    `json:"LoadTimeMs"`
+	BeginTxnTimeMs            int    `json:"BeginTxnTimeMs"`
+	StreamLoadPlanTimeMs      int    `json:"StreamLoadPlanTimeMs"`
+	ReadDataTimeMs            int    `json:"ReadDataTimeMs"`
+	WriteDataTimeMs           int    `json:"WriteDataTimeMs"`
+	CommittedAndPublishTimeMs int    `json:"CommittedAndPublishTimeMs"`
+	ErrorURL                  string `json:"ErrorURL"`
+	Timezone                  string `json:"Timezone"`
+}
+
+// TransactionBeginResponse represents the response for beginning a transaction
+type TransactionBeginResponse struct {
+	TxnId   string `json:"TxnId"`
+	Status  string `json:"Status"`
+	Message string `json:"Message"`
+}
+
+// TransactionPrepareResponse represents the response for preparing a transaction
+type TransactionPrepareResponse struct {
+	TxnId   string `json:"TxnId"`
+	Status  string `json:"Status"`
+	Message string `json:"Message"`
+}
+
+// TransactionCommitResponse represents the response for committing a transaction
+type TransactionCommitResponse struct {
+	TxnId   string `json:"TxnId"`
+	Status  string `json:"Status"`
+	Message string `json:"Message"`
+}
+
+// TransactionRollbackResponse represents the response for rolling back a transaction
+type TransactionRollbackResponse struct {
+	TxnId   string `json:"TxnId"`
+	Status  string `json:"Status"`
+	Message string `json:"Message"`
+}
+
+// Load loads data into StarRocks via stream load
+func (c *Client) Load(table string, data io.Reader, opts LoadOptions) (*LoadResponse, error) {
+	urlStr := fmt.Sprintf("http://%s/api/%s/%s/_stream_load", c.baseURL, c.database, table)
+
+	headers := make(map[string]string)
+	for k, v := range c.defaultHeader {
+		headers[k] = v
+	}
+	headers["Expect"] = "100-continue"
+	headers["strip_outer_array"] = fmt.Sprintf("%t", opts.StripOuterArray)
+
+	if opts.TimeoutStr != "" {
+		headers["timeout"] = opts.TimeoutStr
+	}
+
+	if opts.Compression != CompressionNone {
+		headers["Content-Encoding"] = string(opts.Compression)
+		headers["compression"] = string(opts.Compression)
+	}
+
+	var reader io.Reader = data
+	var err error
+	if opts.Compression != CompressionNone {
+		reader, err = c.compressData(data, opts.Compression)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compress data: %w", err)
+		}
+	}
+
+	queryParams := url.Values{}
+	if opts.Format != "" {
+		queryParams.Add("format", string(opts.Format))
+	}
+	if opts.Columns != "" {
+		queryParams.Add("columns", opts.Columns)
+	}
+	if opts.ColumnSeparator != "" {
+		queryParams.Add("column_separator", opts.ColumnSeparator)
+	}
+	if opts.RowDelimiter != "" {
+		queryParams.Add("row_delimiter", opts.RowDelimiter)
+	}
+	if opts.Where != "" {
+		queryParams.Add("where", opts.Where)
+	}
+	if opts.MaxFilterRatio != "" {
+		queryParams.Add("max_filter_ratio", opts.MaxFilterRatio)
+	}
+	if opts.Label != "" {
+		headers["label"] = opts.Label
+	}
+	if len(opts.Partitions) > 0 {
+		headers["partitions"] = strings.Join(opts.Partitions, ",")
+	}
+	if len(opts.TemporaryPartitions) > 0 {
+		headers["temporary_partitions"] = strings.Join(opts.TemporaryPartitions, ",")
+	}
+	if opts.LogRejectedRecordNum != 0 {
+		headers["log_rejected_record_num"] = fmt.Sprintf("%d", opts.LogRejectedRecordNum)
+	}
+	if opts.Timezone != "" {
+		headers["timezone"] = opts.Timezone
+	}
+	if opts.LoadMemLimit > 0 {
+		headers["load_mem_limit"] = fmt.Sprintf("%d", opts.LoadMemLimit)
+	}
+	if opts.StrictMode {
+		queryParams.Add("strict_mode", "true")
+	}
+
+	if len(queryParams) > 0 {
+		urlStr = urlStr + "?" + queryParams.Encode()
+	}
+
+	req, err := http.NewRequest("PUT", urlStr, reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.SetBasicAuth(c.username, c.password)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var loadResp LoadResponse
+	if err := json.Unmarshal(body, &loadResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &loadResp, fmt.Errorf("stream load failed with status %d: %s", resp.StatusCode, loadResp.Message)
+	}
+
+	if loadResp.Status != "Success" {
+		return &loadResp, fmt.Errorf("stream load failed: %s", loadResp.Message)
+	}
+
+	return &loadResp, nil
+}
+
+// compressData compresses the data reader based on compression type
+func (c *Client) compressData(data io.Reader, compression CompressionType) (io.Reader, error) {
+	switch compression {
+	case CompressionGZIP:
+		return c.compressGZIP(data)
+	case CompressionLZ4:
+		return c.compressLZ4(data)
+	case CompressionZSTD:
+		return c.compressZSTD(data)
+	case CompressionBZIP2:
+		return c.compressBZIP2(data)
+	default:
+		return data, nil
+	}
+}
+
+// compressGZIP compresses data using GZIP
+func (c *Client) compressGZIP(data io.Reader) (io.Reader, error) {
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	if _, err := io.Copy(writer, data); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return &buf, nil
+}
+
+// compressLZ4 compresses data using LZ4
+func (c *Client) compressLZ4(data io.Reader) (io.Reader, error) {
+	var buf bytes.Buffer
+	writer := lz4.NewWriter(&buf)
+	if _, err := io.Copy(writer, data); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return &buf, nil
+}
+
+// compressZSTD compresses data using ZSTD
+func (c *Client) compressZSTD(data io.Reader) (io.Reader, error) {
+	var buf bytes.Buffer
+	encoder, err := zstd.NewWriter(&buf)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(encoder, data); err != nil {
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return &buf, nil
+}
+
+// compressBZIP2 compresses data using BZIP2
+func (c *Client) compressBZIP2(data io.Reader) (io.Reader, error) {
+	var buf bytes.Buffer
+	writer, err := bzip2.NewWriter(&buf, &bzip2.WriterConfig{})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(writer, data); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return &buf, nil
+}
+
+// BeginTransaction begins a new transaction
+func (c *Client) BeginTransaction(tables []string) (*TransactionBeginResponse, error) {
+	urlStr := fmt.Sprintf("http://%s/api/transaction/begin", c.baseURL)
+
+	reqBody := map[string]interface{}{
+		"db":      c.database,
+		"tbl":     tables,
+		"timeout": 600,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(c.username, c.password)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var txnResp TransactionBeginResponse
+	if err := json.Unmarshal(body, &txnResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &txnResp, fmt.Errorf("begin transaction failed with status %d: %s", resp.StatusCode, txnResp.Message)
+	}
+
+	return &txnResp, nil
+}
+
+// PrepareTransaction pre-commits the current transaction
+func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptions) (*TransactionPrepareResponse, error) {
+	urlStr := fmt.Sprintf("http://%s/api/transaction/prepare", c.baseURL)
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	if err := writer.WriteField("txn_id", txnId); err != nil {
+		return nil, fmt.Errorf("failed to write txn_id field: %w", err)
+	}
+
+	var dataBuf bytes.Buffer
+	if _, err := io.Copy(&dataBuf, data); err != nil {
+		return nil, fmt.Errorf("failed to read data: %w", err)
+	}
+
+	if err := writer.WriteField("data", dataBuf.String()); err != nil {
+		return nil, fmt.Errorf("failed to write data field: %w", err)
+	}
+
+	headers := make(map[string]string)
+	for k, v := range c.defaultHeader {
+		headers[k] = v
+	}
+	headers["Expect"] = "100-continue"
+	headers["strip_outer_array"] = fmt.Sprintf("%t", opts.StripOuterArray)
+
+	if opts.TimeoutStr != "" {
+		headers["timeout"] = opts.TimeoutStr
+	}
+
+	if opts.Compression != CompressionNone {
+		headers["Content-Encoding"] = string(opts.Compression)
+		headers["compression"] = string(opts.Compression)
+	}
+
+	if opts.Format != "" {
+		writer.WriteField("format", string(opts.Format))
+	}
+	if opts.Columns != "" {
+		writer.WriteField("columns", opts.Columns)
+	}
+	if opts.ColumnSeparator != "" {
+		writer.WriteField("column_separator", opts.ColumnSeparator)
+	}
+	if opts.RowDelimiter != "" {
+		writer.WriteField("row_delimiter", opts.RowDelimiter)
+	}
+	if opts.Where != "" {
+		writer.WriteField("where", opts.Where)
+	}
+	if opts.MaxFilterRatio != "" {
+		writer.WriteField("max_filter_ratio", opts.MaxFilterRatio)
+	}
+	if opts.Label != "" {
+		headers["label"] = opts.Label
+	}
+	if len(opts.Partitions) > 0 {
+		headers["partitions"] = strings.Join(opts.Partitions, ",")
+	}
+	if len(opts.TemporaryPartitions) > 0 {
+		headers["temporary_partitions"] = strings.Join(opts.TemporaryPartitions, ",")
+	}
+	if opts.LogRejectedRecordNum != 0 {
+		headers["log_rejected_record_num"] = fmt.Sprintf("%d", opts.LogRejectedRecordNum)
+	}
+	if opts.Timezone != "" {
+		headers["timezone"] = opts.Timezone
+	}
+	if opts.LoadMemLimit > 0 {
+		headers["load_mem_limit"] = fmt.Sprintf("%d", opts.LoadMemLimit)
+	}
+	if opts.StrictMode {
+		writer.WriteField("strict_mode", "true")
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	req, err := http.NewRequest("PUT", urlStr, &buf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.SetBasicAuth(c.username, c.password)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var prepResp TransactionPrepareResponse
+	if err := json.Unmarshal(body, &prepResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &prepResp, fmt.Errorf("prepare transaction failed with status %d: %s", resp.StatusCode, prepResp.Message)
+	}
+
+	return &prepResp, nil
+}
+
+// CommitTransaction commits the transaction
+func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, error) {
+	urlStr := fmt.Sprintf("http://%s/api/transaction/commit", c.baseURL)
+
+	reqBody := map[string]string{
+		"txn_id": txnId,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(c.username, c.password)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var commitResp TransactionCommitResponse
+	if err := json.Unmarshal(body, &commitResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &commitResp, fmt.Errorf("commit transaction failed with status %d: %s", resp.StatusCode, commitResp.Message)
+	}
+
+	return &commitResp, nil
+}
+
+// RollbackTransaction rolls back the transaction
+func (c *Client) RollbackTransaction(txnId string) (*TransactionRollbackResponse, error) {
+	urlStr := fmt.Sprintf("http://%s/api/transaction/rollback", c.baseURL)
+
+	reqBody := map[string]string{
+		"txn_id": txnId,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(c.username, c.password)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var rollbackResp TransactionRollbackResponse
+	if err := json.Unmarshal(body, &rollbackResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &rollbackResp, fmt.Errorf("rollback transaction failed with status %d: %s", resp.StatusCode, rollbackResp.Message)
+	}
+
+	return &rollbackResp, nil
+}
