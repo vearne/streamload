@@ -10,12 +10,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	bzip2 "github.com/dsnet/compress/bzip2"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 )
+
+// FEEndpoint represents a StarRocks FE endpoint
+type FEEndpoint struct {
+	Host string
+	Port string
+}
 
 // CompressionType represents the compression algorithm
 type CompressionType string
@@ -61,26 +68,77 @@ type LoadOptions struct {
 
 // Client represents a StarRocks stream load client
 type Client struct {
-	httpClient    *http.Client
-	baseURL       string
-	database      string
-	username      string
-	password      string
-	defaultHeader map[string]string
+	httpClient     *http.Client
+	fes            []FEEndpoint
+	currentFEIndex int
+	database       string
+	username       string
+	password       string
+	defaultHeader  map[string]string
+	mu             sync.RWMutex
 }
 
-// NewClient creates a new StarRocks stream load client
+// NewClient creates a new StarRocks stream load client with a single FE endpoint
 func NewClient(host, port, database, username, password string) *Client {
+	return NewClientWithFEs([]FEEndpoint{{Host: host, Port: port}}, database, username, password)
+}
+
+// NewClientWithFEs creates a new StarRocks stream load client with multiple FE endpoints
+func NewClientWithFEs(fes []FEEndpoint, database, username, password string) *Client {
+	if len(fes) == 0 {
+		panic("at least one FE endpoint is required")
+	}
 	return &Client{
 		httpClient: &http.Client{
 			Timeout: 30 * time.Minute,
+			// Disable automatic redirect following to handle 307 redirects manually
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
-		baseURL:       fmt.Sprintf("%s:%s", host, port),
-		database:      database,
-		username:      username,
-		password:      password,
-		defaultHeader: make(map[string]string),
+		fes:            fes,
+		currentFEIndex: 0,
+		database:       database,
+		username:       username,
+		password:       password,
+		defaultHeader:  make(map[string]string),
 	}
+}
+
+// getCurrentFEURL returns the current FE URL using round-robin selection
+func (c *Client) getCurrentFEURL() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	fe := c.fes[c.currentFEIndex]
+	return fmt.Sprintf("http://%s:%s", fe.Host, fe.Port)
+}
+
+// nextFE rotates to the next FE endpoint
+func (c *Client) nextFE() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.currentFEIndex = (c.currentFEIndex + 1) % len(c.fes)
+}
+
+// doRequest executes HTTP request with failover support
+func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
+	maxRetries := len(c.fes)
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		resp, err := c.httpClient.Do(req)
+		if err == nil {
+			return resp, nil
+		}
+
+		lastErr = err
+
+		c.nextFE()
+		parsedURL, _ := url.Parse(c.getCurrentFEURL())
+		req.URL.Host = parsedURL.Host
+	}
+
+	return nil, lastErr
 }
 
 // SetHTTPClient sets a custom HTTP client
@@ -142,7 +200,7 @@ type TransactionRollbackResponse struct {
 
 // Load loads data into StarRocks via stream load
 func (c *Client) Load(table string, data io.Reader, opts LoadOptions) (*LoadResponse, error) {
-	urlStr := fmt.Sprintf("http://%s/api/%s/%s/_stream_load", c.baseURL, c.database, table)
+	urlStr := fmt.Sprintf("%s/api/%s/%s/_stream_load", c.getCurrentFEURL(), c.database, table)
 
 	headers := make(map[string]string)
 	for k, v := range c.defaultHeader {
@@ -160,13 +218,24 @@ func (c *Client) Load(table string, data io.Reader, opts LoadOptions) (*LoadResp
 		headers["compression"] = string(opts.Compression)
 	}
 
+	// Compress data into buffer to support retry on redirect
+	var dataBuf bytes.Buffer
 	var reader io.Reader = data
 	var err error
 	if opts.Compression != CompressionNone {
-		reader, err = c.compressData(data, opts.Compression)
+		compressedReader, err := c.compressData(data, opts.Compression)
 		if err != nil {
 			return nil, fmt.Errorf("failed to compress data: %w", err)
 		}
+		if _, err := io.Copy(&dataBuf, compressedReader); err != nil {
+			return nil, fmt.Errorf("failed to buffer compressed data: %w", err)
+		}
+		reader = &dataBuf
+	} else {
+		if _, err := io.Copy(&dataBuf, data); err != nil {
+			return nil, fmt.Errorf("failed to buffer data: %w", err)
+		}
+		reader = &dataBuf
 	}
 
 	queryParams := url.Values{}
@@ -224,9 +293,35 @@ func (c *Client) Load(table string, data io.Reader, opts LoadOptions) (*LoadResp
 		req.Header.Set(k, v)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Handle 307 Temporary Redirect from FE to BE
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			resp.Body.Close()
+			return nil, fmt.Errorf("received 307 redirect without Location header")
+		}
+
+		resp.Body.Close()
+
+		redirectReq, err := http.NewRequest("PUT", location, &dataBuf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create redirect request: %w", err)
+		}
+
+		redirectReq.SetBasicAuth(c.username, c.password)
+		for k, v := range headers {
+			redirectReq.Header.Set(k, v)
+		}
+
+		resp, err = c.httpClient.Do(redirectReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send redirect request: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 
@@ -327,7 +422,7 @@ func (c *Client) compressBZIP2(data io.Reader) (io.Reader, error) {
 
 // BeginTransaction begins a new transaction
 func (c *Client) BeginTransaction(tables []string) (*TransactionBeginResponse, error) {
-	urlStr := fmt.Sprintf("http://%s/api/transaction/begin", c.baseURL)
+	urlStr := fmt.Sprintf("%s/api/transaction/begin", c.getCurrentFEURL())
 
 	reqBody := map[string]interface{}{
 		"db":      c.database,
@@ -348,9 +443,33 @@ func (c *Client) BeginTransaction(tables []string) (*TransactionBeginResponse, e
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth(c.username, c.password)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Handle 307 Temporary Redirect from FE to BE
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			resp.Body.Close()
+			return nil, fmt.Errorf("received 307 redirect without Location header")
+		}
+
+		resp.Body.Close()
+
+		redirectReq, err := http.NewRequest("PUT", location, bytes.NewReader(jsonData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create redirect request: %w", err)
+		}
+
+		redirectReq.Header.Set("Content-Type", "application/json")
+		redirectReq.SetBasicAuth(c.username, c.password)
+
+		resp, err = c.httpClient.Do(redirectReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send redirect request: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 
@@ -373,7 +492,7 @@ func (c *Client) BeginTransaction(tables []string) (*TransactionBeginResponse, e
 
 // PrepareTransaction pre-commits the current transaction
 func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptions) (*TransactionPrepareResponse, error) {
-	urlStr := fmt.Sprintf("http://%s/api/transaction/prepare", c.baseURL)
+	urlStr := fmt.Sprintf("%s/api/transaction/prepare", c.getCurrentFEURL())
 
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -462,9 +581,36 @@ func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptio
 		req.Header.Set(k, v)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Handle 307 Temporary Redirect from FE to BE
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			resp.Body.Close()
+			return nil, fmt.Errorf("received 307 redirect without Location header")
+		}
+
+		resp.Body.Close()
+
+		redirectReq, err := http.NewRequest("PUT", location, &buf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create redirect request: %w", err)
+		}
+
+		redirectReq.Header.Set("Content-Type", writer.FormDataContentType())
+		redirectReq.SetBasicAuth(c.username, c.password)
+		for k, v := range headers {
+			redirectReq.Header.Set(k, v)
+		}
+
+		resp, err = c.httpClient.Do(redirectReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send redirect request: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 
@@ -487,7 +633,7 @@ func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptio
 
 // CommitTransaction commits the transaction
 func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, error) {
-	urlStr := fmt.Sprintf("http://%s/api/transaction/commit", c.baseURL)
+	urlStr := fmt.Sprintf("%s/api/transaction/commit", c.getCurrentFEURL())
 
 	reqBody := map[string]string{
 		"txn_id": txnId,
@@ -506,9 +652,33 @@ func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, er
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth(c.username, c.password)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Handle 307 Temporary Redirect from FE to BE
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			resp.Body.Close()
+			return nil, fmt.Errorf("received 307 redirect without Location header")
+		}
+
+		resp.Body.Close()
+
+		redirectReq, err := http.NewRequest("PUT", location, bytes.NewReader(jsonData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create redirect request: %w", err)
+		}
+
+		redirectReq.Header.Set("Content-Type", "application/json")
+		redirectReq.SetBasicAuth(c.username, c.password)
+
+		resp, err = c.httpClient.Do(redirectReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send redirect request: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 
@@ -531,7 +701,7 @@ func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, er
 
 // RollbackTransaction rolls back the transaction
 func (c *Client) RollbackTransaction(txnId string) (*TransactionRollbackResponse, error) {
-	urlStr := fmt.Sprintf("http://%s/api/transaction/rollback", c.baseURL)
+	urlStr := fmt.Sprintf("%s/api/transaction/rollback", c.getCurrentFEURL())
 
 	reqBody := map[string]string{
 		"txn_id": txnId,
@@ -550,9 +720,33 @@ func (c *Client) RollbackTransaction(txnId string) (*TransactionRollbackResponse
 	req.Header.Set("Content-Type", "application/json")
 	req.SetBasicAuth(c.username, c.password)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Handle 307 Temporary Redirect from FE to BE
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			resp.Body.Close()
+			return nil, fmt.Errorf("received 307 redirect without Location header")
+		}
+
+		resp.Body.Close()
+
+		redirectReq, err := http.NewRequest("PUT", location, bytes.NewReader(jsonData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create redirect request: %w", err)
+		}
+
+		redirectReq.Header.Set("Content-Type", "application/json")
+		redirectReq.SetBasicAuth(c.username, c.password)
+
+		resp, err = c.httpClient.Do(redirectReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send redirect request: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 
