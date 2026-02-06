@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -13,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	bzip2 "github.com/dsnet/compress/bzip2"
+	"github.com/dsnet/compress/bzip2"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pierrec/lz4/v4"
 )
@@ -75,6 +76,7 @@ type Client struct {
 	username       string
 	password       string
 	defaultHeader  map[string]string
+	logger         *log.Logger
 	mu             sync.RWMutex
 }
 
@@ -102,6 +104,7 @@ func NewClientWithFEs(fes []FEEndpoint, database, username, password string) *Cl
 		username:       username,
 		password:       password,
 		defaultHeader:  make(map[string]string),
+		logger:         nil,
 	}
 }
 
@@ -126,16 +129,35 @@ func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
 	var lastErr error
 
 	for i := 0; i < maxRetries; i++ {
-		resp, err := c.httpClient.Do(req)
+		feURL := c.getCurrentFEURL()
+		parsedFEURL, err := url.Parse(feURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse FE URL: %w", err)
+		}
+
+		retryReq := req.Clone(req.Context())
+		retryReq.URL.Scheme = parsedFEURL.Scheme
+		retryReq.URL.Host = parsedFEURL.Host
+		retryReq.URL.Path = parsedFEURL.Path + req.URL.Path
+
+		targetURL := retryReq.URL.String()
+		if c.logger != nil {
+			c.logger.Printf("[DEBUG] Attempt %d/%d: Connecting to %s", i+1, maxRetries, targetURL)
+		}
+
+		resp, err := c.httpClient.Do(retryReq)
 		if err == nil {
+			if c.logger != nil {
+				c.logger.Printf("[DEBUG] Success: Connected to %s", targetURL)
+			}
 			return resp, nil
 		}
 
+		if c.logger != nil {
+			c.logger.Printf("[DEBUG] Failed: %s - Error: %v", targetURL, err)
+		}
 		lastErr = err
-
 		c.nextFE()
-		parsedURL, _ := url.Parse(c.getCurrentFEURL())
-		req.URL.Host = parsedURL.Host
 	}
 
 	return nil, lastErr
@@ -149,6 +171,11 @@ func (c *Client) SetHTTPClient(client *http.Client) {
 // SetDefaultHeader sets a default header for all requests
 func (c *Client) SetDefaultHeader(key, value string) {
 	c.defaultHeader[key] = value
+}
+
+// SetLogger sets a custom logger for debugging
+func (c *Client) SetLogger(logger *log.Logger) {
+	c.logger = logger
 }
 
 // LoadResponse represents the response from StarRocks
@@ -506,8 +533,12 @@ func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptio
 		return nil, fmt.Errorf("failed to read data: %w", err)
 	}
 
-	if err := writer.WriteField("data", dataBuf.String()); err != nil {
-		return nil, fmt.Errorf("failed to write data field: %w", err)
+	part, err := writer.CreateFormField("data")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create data field: %w", err)
+	}
+	if _, err := part.Write(dataBuf.Bytes()); err != nil {
+		return nil, fmt.Errorf("failed to write data: %w", err)
 	}
 
 	headers := make(map[string]string)
