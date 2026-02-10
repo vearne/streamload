@@ -43,7 +43,10 @@ func main() {
 		fmt.Printf("Load success! Loaded %d rows, %d bytes\n", resp.NumberLoadedRows, resp.LoadBytes)
 	}
 
-	jsonData := `[{"id": 6, "name": "Frank", "age": 40}, {"id": 7, "name": "Grace", "age": 35}]`
+	jsonData := `[
+	{"id": 6, "name": "Frank", "age": 40, "create_date": "2026-02-10 09:23:48"}, 
+	{"id": 7, "name": "Grace", "age": 35, "create_date": "2026-02-10 09:23:48"}
+]`
 	fmt.Println("\n=== Example 2: Load JSON data ===")
 	resp, err = client.Load("users", strings.NewReader(jsonData), streamload.LoadOptions{
 		Format:          streamload.FormatJSON,

@@ -6,6 +6,7 @@
 ```
 -- 创建主键明细表
 CREATE TABLE IF NOT EXISTS user_details (
+    create_date DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建日期',
     id INT COMMENT '用户ID',
     name VARCHAR(50) COMMENT '用户姓名',
     age INT COMMENT '用户年龄'
