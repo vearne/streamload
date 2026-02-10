@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vearne/streamload"
@@ -25,10 +26,10 @@ func main() {
 	var err error
 
 	csvData := `1,Alice,25
-2,Bob,30
-3,Charlie,35
-4,David,28
-5,Eve,32`
+	2,Bob,30
+	3,Charlie,35
+	4,David,28
+	5,Eve,32`
 
 	fmt.Println("=== Example 1: Load CSV data ===")
 	resp, err = client.Load("users", strings.NewReader(csvData), streamload.LoadOptions{
@@ -162,4 +163,53 @@ func main() {
 		return
 	}
 	fmt.Printf("Transaction rolled back: %d\n", txnResp.TxnId)
+
+	//Example 9: Load structs as CSV
+	fmt.Println("\n=== Example 9: Load structs as CSV ===")
+	type User struct {
+		Id         int       `csv:"id"`
+		Name       string    `csv:"name"`
+		Age        int       `csv:"age"`
+		CreateDate time.Time `csv:"create_date"`
+	}
+
+	csvUsers := []User{
+		{Id: 10, Name: "Ivy", Age: 28, CreateDate: time.Now()},
+		{Id: 11, Name: "Jack", Age: 32, CreateDate: time.Now()},
+		{Id: 12, Name: "Kate", Age: 27, CreateDate: time.Now()},
+	}
+
+	resp, err = client.LoadStructsCSV("users", csvUsers, streamload.LoadOptions{
+		Label: uuid.Must(uuid.NewUUID()).String(),
+	})
+	if err != nil {
+		log.Printf("Load structs CSV failed: %v\n", err)
+	} else {
+		fmt.Printf("Load success! Loaded %d rows, %d bytes\n", resp.NumberLoadedRows, resp.LoadBytes)
+	}
+
+	// Example 10: Load structs as JSON with default ZSTD compression
+	fmt.Println("\n=== Example 10: Load structs as JSON (with default ZSTD compression) ===")
+	type JsonUser struct {
+		Id         int       `json:"id"`
+		Name       string    `json:"name"`
+		Age        int       `json:"age"`
+		CreateDate time.Time `json:"create_date"`
+	}
+
+	jsonUsers := []JsonUser{
+		{Id: 13, Name: "Leo", Age: 33, CreateDate: time.Now()},
+		{Id: 14, Name: "Mia", Age: 29, CreateDate: time.Now()},
+		{Id: 15, Name: "Noah", Age: 31, CreateDate: time.Now()},
+	}
+
+	resp, err = client.LoadStructsJSON("users", jsonUsers, streamload.LoadOptions{
+		Label: uuid.Must(uuid.NewUUID()).String(),
+		// ZSTD compression is enabled by default for JSON
+	})
+	if err != nil {
+		log.Printf("Load structs JSON failed: %v\n", err)
+	} else {
+		fmt.Printf("Load success! Loaded %d rows, %d bytes\n", resp.NumberLoadedRows, resp.LoadBytes)
+	}
 }

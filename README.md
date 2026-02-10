@@ -5,6 +5,7 @@ A Go library for implementing StarRocks Stream Load protocol.
 ## Features
 
 - Support for CSV and JSON data formats
+- **Direct struct loading** (no manual serialization needed)
 - Multiple compression algorithms (GZIP, LZ4, ZSTD, BZIP2)
 - Custom HTTP client configuration
 - Flexible load options (columns, filters, timeouts)
@@ -103,6 +104,51 @@ resp, err := client.Load("users", data, streamload.LoadOptions{
     Format:          streamload.FormatCSV,
     Where:           "age > 20",
     MaxFilterRatio:  "0.1",
+})
+```
+
+### Load Structs Directly
+
+#### CSV Format
+
+Load Go structs directly as CSV without manual serialization:
+
+```go
+type User struct {
+    Id   int    `csv:"id"`
+    Name string `csv:"name"`
+    Age  int    `csv:"age"`
+}
+
+users := []User{
+    {Id: 1, Name: "Alice", Age: 25},
+    {Id: 2, Name: "Bob", Age: 30},
+}
+
+resp, err := client.LoadStructsCSV("users", users, streamload.LoadOptions{
+    Label: "unique-label",
+})
+```
+
+#### JSON Format (with default ZSTD compression)
+
+Load Go structs directly as JSON with automatic ZSTD compression:
+
+```go
+type User struct {
+    Id   int    `json:"id"`
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+}
+
+users := []User{
+    {Id: 1, Name: "Alice", Age: 25},
+    {Id: 2, Name: "Bob", Age: 30},
+}
+
+resp, err := client.LoadStructsJSON("users", users, streamload.LoadOptions{
+    Label: "unique-label",
+    // ZSTD compression is enabled by default
 })
 ```
 
