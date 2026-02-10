@@ -20,7 +20,7 @@ PROPERTIES (
 ```
 -- 创建普通明细表
 CREATE TABLE users (
-    create_date DATE DEFAULT CURRENT_TIMESTAMP COMMENT '创建日期',  -- 分区字段放在第一列
+    create_date DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建日期',  -- 分区字段放在第一列
     id INT COMMENT '用户ID',
     name VARCHAR(50) COMMENT '用户姓名',
     age INT COMMENT '用户年龄'

@@ -79,6 +79,88 @@ Loads data into StarRocks via stream load.
 - `*LoadResponse`: Response containing load statistics
 - `error`: Error if load failed
 
+**LoadStructsCSV**
+
+```go
+func (c *Client) LoadStructsCSV(table string, structs interface{}, opts LoadOptions) (*LoadResponse, error)
+```
+
+Loads a slice of structs as CSV into StarRocks. The structs will be automatically converted to CSV format using their `csv` tags.
+
+**Parameters:**
+- `table`: Target table name
+- `structs`: Slice of structs with `csv` tags (e.g., `[]User`)
+- `opts`: Load options (Format will be automatically set to CSV)
+
+**Returns:**
+- `*LoadResponse`: Response containing load statistics
+- `error`: Error if load failed
+
+**Example:**
+```go
+type User struct {
+    Id   int    `csv:"id"`
+    Name string `csv:"name"`
+    Age  int    `csv:"age"`
+}
+
+users := []User{
+    {Id: 1, Name: "Alice", Age: 25},
+    {Id: 2, Name: "Bob", Age: 30},
+}
+
+resp, err := client.LoadStructsCSV("users", users, streamload.LoadOptions{
+    Label: "unique-label",
+})
+```
+
+**LoadStructsJSON**
+
+```go
+func (c *Client) LoadStructsJSON(table string, structs interface{}, opts LoadOptions) (*LoadResponse, error)
+```
+
+Loads a slice of structs as JSON into StarRocks. The structs will be automatically converted to JSON format using their `json` tags. By default, ZSTD compression is enabled.
+
+**Parameters:**
+- `table`: Target table name
+- `structs`: Slice of structs with `json` tags (e.g., `[]User`)
+- `opts`: Load options (Format will be set to JSON, Compression defaults to ZSTD if not specified)
+
+**Returns:**
+- `*LoadResponse`: Response containing load statistics
+- `error`: Error if load failed
+
+**Default Behavior:**
+- Format: `FormatJSON`
+- Compression: `CompressionZSTD` (can be overridden in opts)
+- StripOuterArray: `true`
+
+**Example:**
+```go
+type User struct {
+    Id   int    `json:"id"`
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+}
+
+users := []User{
+    {Id: 1, Name: "Alice", Age: 25},
+    {Id: 2, Name: "Bob", Age: 30},
+}
+
+// With default ZSTD compression
+resp, err := client.LoadStructsJSON("users", users, streamload.LoadOptions{
+    Label: "unique-label",
+})
+
+// Override compression
+resp, err := client.LoadStructsJSON("users", users, streamload.LoadOptions{
+    Label:       "unique-label",
+    Compression: streamload.CompressionGZIP,
+})
+```
+
 ### LoadOptions
  
 ```go

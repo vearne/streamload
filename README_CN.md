@@ -5,6 +5,7 @@
 ## 特性
 
 - 支持 CSV 和 JSON 数据格式
+- **直接加载 Go 结构体**（无需手动序列化）
 - 多种压缩算法（GZIP、LZ4、ZSTD、BZIP2）
 - 自定义 HTTP 客户端配置
 - 灵活的加载选项（列、过滤器、超时）
@@ -103,6 +104,51 @@ resp, err := client.Load("users", data, streamload.LoadOptions{
     Format:          streamload.FormatCSV,
     Where:           "age > 20",
     MaxFilterRatio:  "0.1",
+})
+```
+
+### 直接加载结构体
+
+#### CSV 格式
+
+无需手动序列化，直接加载 Go 结构体为 CSV 格式：
+
+```go
+type User struct {
+    Id   int    `csv:"id"`
+    Name string `csv:"name"`
+    Age  int    `csv:"age"`
+}
+
+users := []User{
+    {Id: 1, Name: "Alice", Age: 25},
+    {Id: 2, Name: "Bob", Age: 30},
+}
+
+resp, err := client.LoadStructsCSV("users", users, streamload.LoadOptions{
+    Label: "unique-label",
+})
+```
+
+#### JSON 格式（默认启用 ZSTD 压缩）
+
+直接加载 Go 结构体为 JSON 格式，自动启用 ZSTD 压缩：
+
+```go
+type User struct {
+    Id   int    `json:"id"`
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+}
+
+users := []User{
+    {Id: 1, Name: "Alice", Age: 25},
+    {Id: 2, Name: "Bob", Age: 30},
+}
+
+resp, err := client.LoadStructsJSON("users", users, streamload.LoadOptions{
+    Label: "unique-label",
+    // 默认已启用 ZSTD 压缩
 })
 ```
 
