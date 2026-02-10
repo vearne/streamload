@@ -12,11 +12,11 @@ import (
 
 func main() {
 	client := streamload.NewClient(
-		"10.128.246.182",
+		"192.168.8.122",
 		"8030",
 		"test",
 		"root",
-		"8A09-62378A8DF015",
+		"",
 	)
 
 	client.SetLogger(log.New(os.Stdout, "", 0))
@@ -134,7 +134,7 @@ func main() {
 		log.Printf("Prepare transaction failed: %v\n", err)
 		return
 	}
-	fmt.Printf("Transaction prepared: TxnId=%d, Status: %s, Loaded %d rows\n", 
+	fmt.Printf("Transaction prepared: TxnId=%d, Status: %s, Loaded %d rows\n",
 		prepareResp.TxnId, prepareResp.Status, prepareResp.NumberLoadedRows)
 
 	// Commit transaction
@@ -143,7 +143,7 @@ func main() {
 		log.Printf("Commit transaction failed: %v\n", err)
 		return
 	}
-	fmt.Printf("Transaction committed: TxnId=%d, Status: %s\n", 
+	fmt.Printf("Transaction committed: TxnId=%d, Status: %s\n",
 		commitResp.TxnId, commitResp.Status)
 
 	fmt.Println("\n=== Example 8: Two-Phase Commit with Rollback ===")
