@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -59,6 +58,7 @@ type LoadOptions struct {
 	StripOuterArray bool
 
 	Label               string
+	Table               string
 	Partitions          []string
 	TemporaryPartitions []string
 
@@ -199,28 +199,48 @@ type LoadResponse struct {
 
 // TransactionBeginResponse represents the response for beginning a transaction
 type TransactionBeginResponse struct {
-	TxnId   string `json:"TxnId"`
+	TxnId   int64  `json:"TxnId"`
 	Status  string `json:"Status"`
 	Message string `json:"Message"`
 }
 
 // TransactionPrepareResponse represents the response for preparing a transaction
 type TransactionPrepareResponse struct {
-	TxnId   string `json:"TxnId"`
-	Status  string `json:"Status"`
-	Message string `json:"Message"`
+	TxnId                     int64  `json:"TxnId"`
+	Status                    string `json:"Status"`
+	Message                   string `json:"Message"`
+	NumberTotalRows           int    `json:"NumberTotalRows"`
+	NumberLoadedRows          int    `json:"NumberLoadedRows"`
+	NumberFilteredRows        int    `json:"NumberFilteredRows"`
+	NumberUnselectedRows      int    `json:"NumberUnselectedRows"`
+	LoadBytes                 int    `json:"LoadBytes"`
+	LoadTimeMs                int    `json:"LoadTimeMs"`
+	StreamLoadPutTimeMs       int    `json:"StreamLoadPutTimeMs"`
+	ReceivedDataTimeMs        int    `json:"ReceivedDataTimeMs"`
+	WriteDataTimeMs           int    `json:"WriteDataTimeMs"`
+	CommitAndPublishTimeMs    int    `json:"CommitAndPublishTimeMs"`
 }
 
 // TransactionCommitResponse represents the response for committing a transaction
 type TransactionCommitResponse struct {
-	TxnId   string `json:"TxnId"`
-	Status  string `json:"Status"`
-	Message string `json:"Message"`
+	TxnId                     int64  `json:"TxnId"`
+	Status                    string `json:"Status"`
+	Message                   string `json:"Message"`
+	NumberTotalRows           int    `json:"NumberTotalRows"`
+	NumberLoadedRows          int    `json:"NumberLoadedRows"`
+	NumberFilteredRows        int    `json:"NumberFilteredRows"`
+	NumberUnselectedRows      int    `json:"NumberUnselectedRows"`
+	LoadBytes                 int    `json:"LoadBytes"`
+	LoadTimeMs                int    `json:"LoadTimeMs"`
+	StreamLoadPutTimeMs       int    `json:"StreamLoadPutTimeMs"`
+	ReceivedDataTimeMs        int    `json:"ReceivedDataTimeMs"`
+	WriteDataTimeMs           int    `json:"WriteDataTimeMs"`
+	CommitAndPublishTimeMs    int    `json:"CommitAndPublishTimeMs"`
 }
 
 // TransactionRollbackResponse represents the response for rolling back a transaction
 type TransactionRollbackResponse struct {
-	TxnId   string `json:"TxnId"`
+	TxnId   int64  `json:"TxnId"`
 	Status  string `json:"Status"`
 	Message string `json:"Message"`
 }
@@ -236,12 +256,34 @@ func (c *Client) Load(table string, data io.Reader, opts LoadOptions) (*LoadResp
 	headers["Expect"] = "100-continue"
 	headers["strip_outer_array"] = fmt.Sprintf("%t", opts.StripOuterArray)
 
+	if opts.Format != "" {
+		headers["format"] = string(opts.Format)
+	}
+	if opts.Columns != "" {
+		headers["columns"] = opts.Columns
+	}
+	if opts.ColumnSeparator != "" {
+		headers["column_separator"] = opts.ColumnSeparator
+	}
+	if opts.RowDelimiter != "" {
+		headers["row_delimiter"] = opts.RowDelimiter
+	}
+	if opts.Where != "" {
+		headers["where"] = opts.Where
+	}
+	if opts.MaxFilterRatio != "" {
+		headers["max_filter_ratio"] = opts.MaxFilterRatio
+	}
+
 	if opts.TimeoutStr != "" {
 		headers["timeout"] = opts.TimeoutStr
 	}
 
+	if opts.StrictMode {
+		headers["strict_mode"] = "true"
+	}
+
 	if opts.Compression != CompressionNone {
-		headers["Content-Encoding"] = string(opts.Compression)
 		headers["compression"] = string(opts.Compression)
 	}
 
@@ -265,25 +307,6 @@ func (c *Client) Load(table string, data io.Reader, opts LoadOptions) (*LoadResp
 		reader = &dataBuf
 	}
 
-	queryParams := url.Values{}
-	if opts.Format != "" {
-		queryParams.Add("format", string(opts.Format))
-	}
-	if opts.Columns != "" {
-		queryParams.Add("columns", opts.Columns)
-	}
-	if opts.ColumnSeparator != "" {
-		queryParams.Add("column_separator", opts.ColumnSeparator)
-	}
-	if opts.RowDelimiter != "" {
-		queryParams.Add("row_delimiter", opts.RowDelimiter)
-	}
-	if opts.Where != "" {
-		queryParams.Add("where", opts.Where)
-	}
-	if opts.MaxFilterRatio != "" {
-		queryParams.Add("max_filter_ratio", opts.MaxFilterRatio)
-	}
 	if opts.Label != "" {
 		headers["label"] = opts.Label
 	}
@@ -301,13 +324,6 @@ func (c *Client) Load(table string, data io.Reader, opts LoadOptions) (*LoadResp
 	}
 	if opts.LoadMemLimit > 0 {
 		headers["load_mem_limit"] = fmt.Sprintf("%d", opts.LoadMemLimit)
-	}
-	if opts.StrictMode {
-		queryParams.Add("strict_mode", "true")
-	}
-
-	if len(queryParams) > 0 {
-		urlStr = urlStr + "?" + queryParams.Encode()
 	}
 
 	req, err := http.NewRequest("PUT", urlStr, reader)
@@ -447,28 +463,28 @@ func (c *Client) compressBZIP2(data io.Reader) (io.Reader, error) {
 	return &buf, nil
 }
 
-// BeginTransaction begins a new transaction
-func (c *Client) BeginTransaction(tables []string) (*TransactionBeginResponse, error) {
+// BeginTransaction begins a new transaction with the specified label
+func (c *Client) BeginTransaction(label string, tables []string) (*TransactionBeginResponse, error) {
 	urlStr := fmt.Sprintf("%s/api/transaction/begin", c.getCurrentFEURL())
 
-	reqBody := map[string]interface{}{
-		"db":      c.database,
-		"tbl":     tables,
-		"timeout": 600,
-	}
+	// Always use table as string (StarRocks expects string, not array element)
+	tableValue := tables[0]
 
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(jsonData))
+	req, err := http.NewRequest("POST", urlStr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Expect", "100-continue")
+	req.Header.Set("label", label)
+	req.Header.Set("db", c.database)
+	req.Header.Set("table", tableValue)
 	req.SetBasicAuth(c.username, c.password)
+
+	if c.logger != nil {
+		c.logger.Printf("[DEBUG] BeginTransaction Headers: %+v", req.Header)
+	}
 
 	resp, err := c.doRequest(req)
 	if err != nil {
@@ -485,12 +501,16 @@ func (c *Client) BeginTransaction(tables []string) (*TransactionBeginResponse, e
 
 		resp.Body.Close()
 
-		redirectReq, err := http.NewRequest("PUT", location, bytes.NewReader(jsonData))
+		redirectReq, err := http.NewRequest("POST", location, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create redirect request: %w", err)
 		}
 
 		redirectReq.Header.Set("Content-Type", "application/json")
+		redirectReq.Header.Set("Expect", "100-continue")
+		redirectReq.Header.Set("label", label)
+		redirectReq.Header.Set("db", c.database)
+		redirectReq.Header.Set("table", tableValue)
 		redirectReq.SetBasicAuth(c.username, c.password)
 
 		resp, err = c.httpClient.Do(redirectReq)
@@ -518,99 +538,20 @@ func (c *Client) BeginTransaction(tables []string) (*TransactionBeginResponse, e
 }
 
 // PrepareTransaction pre-commits the current transaction
-func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptions) (*TransactionPrepareResponse, error) {
+// Note: This should be called after loading data with LoadTransaction
+func (c *Client) PrepareTransaction(label string) (*TransactionPrepareResponse, error) {
 	urlStr := fmt.Sprintf("%s/api/transaction/prepare", c.getCurrentFEURL())
 
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	if err := writer.WriteField("txn_id", txnId); err != nil {
-		return nil, fmt.Errorf("failed to write txn_id field: %w", err)
-	}
-
-	var dataBuf bytes.Buffer
-	if _, err := io.Copy(&dataBuf, data); err != nil {
-		return nil, fmt.Errorf("failed to read data: %w", err)
-	}
-
-	part, err := writer.CreateFormField("data")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create data field: %w", err)
-	}
-	if _, err := part.Write(dataBuf.Bytes()); err != nil {
-		return nil, fmt.Errorf("failed to write data: %w", err)
-	}
-
-	headers := make(map[string]string)
-	for k, v := range c.defaultHeader {
-		headers[k] = v
-	}
-	headers["Expect"] = "100-continue"
-	headers["strip_outer_array"] = fmt.Sprintf("%t", opts.StripOuterArray)
-
-	if opts.TimeoutStr != "" {
-		headers["timeout"] = opts.TimeoutStr
-	}
-
-	if opts.Compression != CompressionNone {
-		headers["Content-Encoding"] = string(opts.Compression)
-		headers["compression"] = string(opts.Compression)
-	}
-
-	if opts.Format != "" {
-		writer.WriteField("format", string(opts.Format))
-	}
-	if opts.Columns != "" {
-		writer.WriteField("columns", opts.Columns)
-	}
-	if opts.ColumnSeparator != "" {
-		writer.WriteField("column_separator", opts.ColumnSeparator)
-	}
-	if opts.RowDelimiter != "" {
-		writer.WriteField("row_delimiter", opts.RowDelimiter)
-	}
-	if opts.Where != "" {
-		writer.WriteField("where", opts.Where)
-	}
-	if opts.MaxFilterRatio != "" {
-		writer.WriteField("max_filter_ratio", opts.MaxFilterRatio)
-	}
-	if opts.Label != "" {
-		headers["label"] = opts.Label
-	}
-	if len(opts.Partitions) > 0 {
-		headers["partitions"] = strings.Join(opts.Partitions, ",")
-	}
-	if len(opts.TemporaryPartitions) > 0 {
-		headers["temporary_partitions"] = strings.Join(opts.TemporaryPartitions, ",")
-	}
-	if opts.LogRejectedRecordNum != 0 {
-		headers["log_rejected_record_num"] = fmt.Sprintf("%d", opts.LogRejectedRecordNum)
-	}
-	if opts.Timezone != "" {
-		headers["timezone"] = opts.Timezone
-	}
-	if opts.LoadMemLimit > 0 {
-		headers["load_mem_limit"] = fmt.Sprintf("%d", opts.LoadMemLimit)
-	}
-	if opts.StrictMode {
-		writer.WriteField("strict_mode", "true")
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
-	}
-
-	req, err := http.NewRequest("PUT", urlStr, &buf)
+	req, err := http.NewRequest("POST", urlStr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Expect", "100-continue")
+	req.Header.Set("label", label)
+	req.Header.Set("db", c.database)
 	req.SetBasicAuth(c.username, c.password)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
 
 	resp, err := c.doRequest(req)
 	if err != nil {
@@ -627,16 +568,16 @@ func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptio
 
 		resp.Body.Close()
 
-		redirectReq, err := http.NewRequest("PUT", location, &buf)
+		redirectReq, err := http.NewRequest("POST", location, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create redirect request: %w", err)
 		}
 
-		redirectReq.Header.Set("Content-Type", writer.FormDataContentType())
+		redirectReq.Header.Set("Content-Type", "application/json")
+		redirectReq.Header.Set("Expect", "100-continue")
+		redirectReq.Header.Set("label", label)
+		redirectReq.Header.Set("db", c.database)
 		redirectReq.SetBasicAuth(c.username, c.password)
-		for k, v := range headers {
-			redirectReq.Header.Set(k, v)
-		}
 
 		resp, err = c.httpClient.Do(redirectReq)
 		if err != nil {
@@ -659,28 +600,179 @@ func (c *Client) PrepareTransaction(txnId string, data io.Reader, opts LoadOptio
 		return &prepResp, fmt.Errorf("prepare transaction failed with status %d: %s", resp.StatusCode, prepResp.Message)
 	}
 
+	if prepResp.Status != "OK" {
+		return &prepResp, fmt.Errorf("prepare transaction failed: %s", prepResp.Message)
+	}
+
 	return &prepResp, nil
 }
 
-// CommitTransaction commits the transaction
-func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, error) {
+// LoadTransaction loads data into a transaction with specified label
+func (c *Client) LoadTransaction(label, table string, data io.Reader, opts LoadOptions) (*LoadResponse, error) {
+	urlStr := fmt.Sprintf("%s/api/transaction/load", c.getCurrentFEURL())
+
+	// Compress data into buffer to support retry on redirect
+	var dataBuf bytes.Buffer
+	var err error
+	if opts.Compression != CompressionNone {
+		compressedReader, err := c.compressData(data, opts.Compression)
+		if err != nil {
+			return nil, fmt.Errorf("failed to compress data: %w", err)
+		}
+		if _, err := io.Copy(&dataBuf, compressedReader); err != nil {
+			return nil, fmt.Errorf("failed to buffer compressed data: %w", err)
+		}
+	} else {
+		if _, err := io.Copy(&dataBuf, data); err != nil {
+			return nil, fmt.Errorf("failed to buffer data: %w", err)
+		}
+	}
+
+	// Use bytes.NewReader to support seeking for retries
+	reader := bytes.NewReader(dataBuf.Bytes())
+
+	if c.logger != nil {
+		c.logger.Printf("[DEBUG] LoadTransaction: Data size = %d bytes", dataBuf.Len())
+	}
+
+	headers := make(map[string]string)
+	for k, v := range c.defaultHeader {
+		headers[k] = v
+	}
+	headers["Expect"] = "100-continue"
+	headers["strip_outer_array"] = fmt.Sprintf("%t", opts.StripOuterArray)
+	headers["label"] = label
+	headers["db"] = c.database
+	headers["table"] = table
+
+	if opts.TimeoutStr != "" {
+		headers["timeout"] = opts.TimeoutStr
+	}
+
+	if opts.Compression != CompressionNone {
+		headers["compression"] = string(opts.Compression)
+	}
+
+	if opts.Format != "" {
+		headers["format"] = string(opts.Format)
+	}
+	if opts.Columns != "" {
+		headers["columns"] = opts.Columns
+	}
+	if opts.ColumnSeparator != "" {
+		headers["column_separator"] = opts.ColumnSeparator
+	}
+	if opts.RowDelimiter != "" {
+		headers["row_delimiter"] = opts.RowDelimiter
+	}
+	if opts.Where != "" {
+		headers["where"] = opts.Where
+	}
+	if opts.MaxFilterRatio != "" {
+		headers["max_filter_ratio"] = opts.MaxFilterRatio
+	}
+	if len(opts.Partitions) > 0 {
+		headers["partitions"] = strings.Join(opts.Partitions, ",")
+	}
+	if len(opts.TemporaryPartitions) > 0 {
+		headers["temporary_partitions"] = strings.Join(opts.TemporaryPartitions, ",")
+	}
+	if opts.LogRejectedRecordNum != 0 {
+		headers["log_rejected_record_num"] = fmt.Sprintf("%d", opts.LogRejectedRecordNum)
+	}
+	if opts.Timezone != "" {
+		headers["timezone"] = opts.Timezone
+	}
+	if opts.LoadMemLimit > 0 {
+		headers["load_mem_limit"] = fmt.Sprintf("%d", opts.LoadMemLimit)
+	}
+	if opts.StrictMode {
+		headers["strict_mode"] = "true"
+	}
+
+	req, err := http.NewRequest("PUT", urlStr, reader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.SetBasicAuth(c.username, c.password)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.doRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	// Handle 307 Temporary Redirect from FE to BE
+	if resp.StatusCode == http.StatusTemporaryRedirect {
+		location := resp.Header.Get("Location")
+		if location == "" {
+			resp.Body.Close()
+			return nil, fmt.Errorf("received 307 redirect without Location header")
+		}
+
+		resp.Body.Close()
+
+		// Reset reader position for retry
+		reader.Seek(0, io.SeekStart)
+
+		redirectReq, err := http.NewRequest("PUT", location, reader)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create redirect request: %w", err)
+		}
+
+		redirectReq.SetBasicAuth(c.username, c.password)
+		for k, v := range headers {
+			redirectReq.Header.Set(k, v)
+		}
+
+		resp, err = c.httpClient.Do(redirectReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send redirect request: %w", err)
+		}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if c.logger != nil {
+		c.logger.Printf("[DEBUG] LoadTransaction: Response body = %s", string(body))
+	}
+	
+	var loadResp LoadResponse
+	if err := json.Unmarshal(body, &loadResp); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &loadResp, fmt.Errorf("transaction load failed with status %d: %s", resp.StatusCode, loadResp.Message)
+	}
+
+	if loadResp.Status != "OK" {
+		return &loadResp, fmt.Errorf("transaction load failed: %s", loadResp.Message)
+	}
+
+	return &loadResp, nil
+}
+
+// CommitTransaction commits the transaction with the specified label
+func (c *Client) CommitTransaction(label string) (*TransactionCommitResponse, error) {
 	urlStr := fmt.Sprintf("%s/api/transaction/commit", c.getCurrentFEURL())
 
-	reqBody := map[string]string{
-		"txn_id": txnId,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(jsonData))
+	req, err := http.NewRequest("POST", urlStr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Expect", "100-continue")
+	req.Header.Set("label", label)
+	req.Header.Set("db", c.database)
 	req.SetBasicAuth(c.username, c.password)
 
 	resp, err := c.doRequest(req)
@@ -698,12 +790,15 @@ func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, er
 
 		resp.Body.Close()
 
-		redirectReq, err := http.NewRequest("PUT", location, bytes.NewReader(jsonData))
+		redirectReq, err := http.NewRequest("POST", location, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create redirect request: %w", err)
 		}
 
 		redirectReq.Header.Set("Content-Type", "application/json")
+		redirectReq.Header.Set("Expect", "100-continue")
+		redirectReq.Header.Set("label", label)
+		redirectReq.Header.Set("db", c.database)
 		redirectReq.SetBasicAuth(c.username, c.password)
 
 		resp, err = c.httpClient.Do(redirectReq)
@@ -718,6 +813,10 @@ func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, er
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	if c.logger != nil {
+		c.logger.Printf("[DEBUG] CommitTransaction: Response body = %s", string(body))
+	}
+
 	var commitResp TransactionCommitResponse
 	if err := json.Unmarshal(body, &commitResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
@@ -730,25 +829,19 @@ func (c *Client) CommitTransaction(txnId string) (*TransactionCommitResponse, er
 	return &commitResp, nil
 }
 
-// RollbackTransaction rolls back the transaction
-func (c *Client) RollbackTransaction(txnId string) (*TransactionRollbackResponse, error) {
+// RollbackTransaction rolls back the transaction with the specified label
+func (c *Client) RollbackTransaction(label string) (*TransactionRollbackResponse, error) {
 	urlStr := fmt.Sprintf("%s/api/transaction/rollback", c.getCurrentFEURL())
 
-	reqBody := map[string]string{
-		"txn_id": txnId,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("PUT", urlStr, bytes.NewReader(jsonData))
+	req, err := http.NewRequest("POST", urlStr, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Expect", "100-continue")
+	req.Header.Set("label", label)
+	req.Header.Set("db", c.database)
 	req.SetBasicAuth(c.username, c.password)
 
 	resp, err := c.doRequest(req)
@@ -766,12 +859,15 @@ func (c *Client) RollbackTransaction(txnId string) (*TransactionRollbackResponse
 
 		resp.Body.Close()
 
-		redirectReq, err := http.NewRequest("PUT", location, bytes.NewReader(jsonData))
+		redirectReq, err := http.NewRequest("POST", location, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create redirect request: %w", err)
 		}
 
 		redirectReq.Header.Set("Content-Type", "application/json")
+		redirectReq.Header.Set("Expect", "100-continue")
+		redirectReq.Header.Set("label", label)
+		redirectReq.Header.Set("db", c.database)
 		redirectReq.SetBasicAuth(c.username, c.password)
 
 		resp, err = c.httpClient.Do(redirectReq)
