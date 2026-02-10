@@ -6,8 +6,19 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/gocarina/gocsv"
+)
+
+var (
+	// csvColumnsCache caches column names for CSV structs to avoid repeated reflection
+	csvColumnsCache   = make(map[reflect.Type]string)
+	csvColumnsCacheMu sync.RWMutex
+
+	// jsonColumnsCache caches column names for JSON structs to avoid repeated reflection
+	jsonColumnsCache   = make(map[reflect.Type]string)
+	jsonColumnsCacheMu sync.RWMutex
 )
 
 // LoadStructsCSV loads a slice of structs as CSV into StarRocks
@@ -77,6 +88,7 @@ func (c *Client) LoadStructsJSON(table string, structs interface{}, opts LoadOpt
 }
 
 // extractCSVColumns extracts column names from struct csv tags using reflection
+// Results are cached to avoid repeated reflection operations
 func extractCSVColumns(structs interface{}) (string, error) {
 	val := reflect.ValueOf(structs)
 
@@ -108,6 +120,14 @@ func extractCSVColumns(structs interface{}) (string, error) {
 		return "", fmt.Errorf("slice elements must be structs, got %s", elemType.Kind())
 	}
 
+	// Check cache first
+	csvColumnsCacheMu.RLock()
+	if cached, ok := csvColumnsCache[elemType]; ok {
+		csvColumnsCacheMu.RUnlock()
+		return cached, nil
+	}
+	csvColumnsCacheMu.RUnlock()
+
 	// Extract column names from csv tags
 	var columns []string
 	for i := 0; i < elemType.NumField(); i++ {
@@ -133,10 +153,18 @@ func extractCSVColumns(structs interface{}) (string, error) {
 	}
 
 	// Join columns with comma
-	return strings.Join(columns, ","), nil
+	result := strings.Join(columns, ",")
+
+	// Cache the result
+	csvColumnsCacheMu.Lock()
+	csvColumnsCache[elemType] = result
+	csvColumnsCacheMu.Unlock()
+
+	return result, nil
 }
 
 // extractJSONColumns extracts column names from struct json tags using reflection
+// Results are cached to avoid repeated reflection operations
 func extractJSONColumns(structs interface{}) (string, error) {
 	val := reflect.ValueOf(structs)
 
@@ -168,6 +196,14 @@ func extractJSONColumns(structs interface{}) (string, error) {
 		return "", fmt.Errorf("slice elements must be structs, got %s", elemType.Kind())
 	}
 
+	// Check cache first
+	jsonColumnsCacheMu.RLock()
+	if cached, ok := jsonColumnsCache[elemType]; ok {
+		jsonColumnsCacheMu.RUnlock()
+		return cached, nil
+	}
+	jsonColumnsCacheMu.RUnlock()
+
 	// Extract column names from json tags
 	var columns []string
 	for i := 0; i < elemType.NumField(); i++ {
@@ -198,5 +234,12 @@ func extractJSONColumns(structs interface{}) (string, error) {
 	}
 
 	// Join columns with comma
-	return strings.Join(columns, ","), nil
+	result := strings.Join(columns, ",")
+
+	// Cache the result
+	jsonColumnsCacheMu.Lock()
+	jsonColumnsCache[elemType] = result
+	jsonColumnsCacheMu.Unlock()
+
+	return result, nil
 }
